@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bubble Screensaver · Lithos</title>
+  <meta name="description" content="一个仿 Windows 经典彩色泡泡屏保的 Canvas 背景效果。" />
+  <style>
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+    }
+
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+      /* 整个页面背景明显调亮，偏冷色系 */
+      background: radial-gradient(circle at top, #e5f0ff 0, #cbd5ff 40%, #64748b 100%);
+      color: #0f172a;
+      overflow: hidden;
+    }
+
+    #bubble-canvas {
+      position: fixed;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+
+    .overlay-label {
+      position: fixed;
+      right: 16px;
+      bottom: 14px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(15, 23, 42, 0.18);
+      color: rgba(15, 23, 42, 0.75);
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      backdrop-filter: blur(12px) saturate(140%);
+      border: 1px solid rgba(148, 163, 184, 0.45);
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="bubble-canvas"></canvas>
+  <div class="overlay-label">Bubble Screensaver · Lithos</div>
+
+  <script>
+    (function () {
+      var DEFAULT_CONFIG = {
+        bubbleCount: 24,
+        minRadius: 34,
+        maxRadius: 90,
+        maxSpeed: 45, // px / s，运动幅度更大
+        opacity: 0.85,
+        trailAlpha: 0.14, // 0 = 强拖影, 1 = 无拖影
+        enableSoftBody: true,
+        softBodyStrength: 0.8,
+        splitMinRadius: 28,
+        colors: [
+          'rgba(56, 189, 248, 0.55)',  // 更饱和的天蓝
+          'rgba(129, 140, 248, 0.55)', // 更饱和的靛紫
+          'rgba(244, 114, 182, 0.55)', // 更饱和的粉
+          'rgba(52, 211, 153, 0.5)',   // 更饱和的绿色
+          'rgba(251, 146, 60, 0.5)'    // 更饱和的橙色
+        ]
+      };
+
+      function mergeConfig(base, override) {
+        if (!override) return base;
+        var out = {};
+        Object.keys(base).forEach(function (k) { out[k] = base[k]; });
+        Object.keys(override).forEach(function (k) {
+          if (override[k] !== undefined) out[k] = override[k];
+        });
+        return out;
+      }
+
+      function BubblesScreensaver(canvas, config) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.config = mergeConfig(DEFAULT_CONFIG, config || {});
+        this.bubbles = [];
+        this.lastTime = 0;
+        this.running = false;
+        this.resizeObserver = null;
+
+        this._handleResize = this.handleResize.bind(this);
+        this._handleClick = this.handleClick.bind(this);
+        this._loop = this.loop.bind(this);
+
+        this.handleResize();
+        this.initBubbles();
+        this.start();
+        window.addEventListener('resize', this._handleResize);
+        this.canvas.addEventListener('click', this._handleClick);
+      }
+
+      BubblesScreensaver.prototype.destroy = function () {
+        this.running = false;
+        window.removeEventListener('resize', this._handleResize);
+        this.canvas.removeEventListener('click', this._handleClick);
+      };
+
+      BubblesScreensaver.prototype.handleResize = function () {
+        var ratio = window.devicePixelRatio || 1;
+        var width = window.innerWidth;
+        var height = window.innerHeight;
+        this.canvas.width = width * ratio;
+        this.canvas.height = height * ratio;
+        this.canvas.style.width = width + 'px';
+        this.canvas.style.height = height + 'px';
+        this.ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+      };
+
+      BubblesScreensaver.prototype.initBubbles = function () {
+        var cfg = this.config;
+        var w = this.canvas.width / (window.devicePixelRatio || 1);
+        var h = this.canvas.height / (window.devicePixelRatio || 1);
+        this.bubbles.length = 0;
+
+        for (var i = 0; i < cfg.bubbleCount; i++) {
+          var r = cfg.minRadius + Math.random() * (cfg.maxRadius - cfg.minRadius);
+          var speed = 10 + Math.random() * (cfg.maxSpeed - 10);
+          var angle = Math.random() * Math.PI * 2;
+
+          this.bubbles.push(this.createBubble(
+            Math.random() * w,
+            Math.random() * h,
+            r,
+            cfg.colors[i % cfg.colors.length],
+            Math.cos(angle) * speed,
+            Math.sin(angle) * speed
+          ));
+        }
+      };
+
+      BubblesScreensaver.prototype.createBubble = function (x, y, r, color, vx, vy) {
+        var radius = r;
+        var mass = radius * radius;
+        return {
+          x: x,
+          y: y,
+          vx: vx || 0,
+          vy: vy || 0,
+          r: radius,
+          baseR: radius,
+          mass: mass,
+          color: color,
+          squish: 0,
+          squishAngle: 0
+        };
+      };
+
+      BubblesScreensaver.prototype.start = function () {
+        if (this.running) return;
+        this.running = true;
+        this.lastTime = performance.now();
+        requestAnimationFrame(this._loop);
+      };
+
+      BubblesScreensaver.prototype.loop = function (now) {
+        if (!this.running) return;
+        var dt = Math.min(64, now - this.lastTime);
+        this.lastTime = now;
+        var dtSeconds = dt / 1000;
+
+        this.update(dtSeconds);
+        this.draw();
+
+        requestAnimationFrame(this._loop);
+      };
+
+      BubblesScreensaver.prototype.update = function (dt) {
+        var cfg = this.config;
+        var w = this.canvas.width / (window.devicePixelRatio || 1);
+        var h = this.canvas.height / (window.devicePixelRatio || 1);
+        var bubbles = this.bubbles;
+
+        // 运动 & 边界反弹
+        for (var i = 0; i < bubbles.length; i++) {
+          var b = bubbles[i];
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+
+          // 软体挤压衰减
+          b.squish *= 0.9;
+
+          if (b.x - b.r < 0) {
+            b.x = b.r;
+            b.vx = Math.abs(b.vx);
+          } else if (b.x + b.r > w) {
+            b.x = w - b.r;
+            b.vx = -Math.abs(b.vx);
+          }
+
+          if (b.y - b.r < 0) {
+            b.y = b.r;
+            b.vy = Math.abs(b.vy);
+          } else if (b.y + b.r > h) {
+            b.y = h - b.r;
+            b.vy = -Math.abs(b.vy);
+          }
+        }
+
+        // 互相碰撞 + 挤压
+        for (var i = 0; i < bubbles.length; i++) {
+          for (var j = i + 1; j < bubbles.length; j++) {
+            this.resolveCollision(bubbles[i], bubbles[j], cfg);
+          }
+        }
+      };
+
+      BubblesScreensaver.prototype.handleClick = function (event) {
+        var rect = this.canvas.getBoundingClientRect();
+        var x = event.clientX - rect.left;
+        var y = event.clientY - rect.top;
+
+        // 找离点击点最近且被点中的泡泡（从后往前，视觉上更靠上的优先）
+        var bubbles = this.bubbles;
+        var targetIndex = -1;
+        for (var i = bubbles.length - 1; i >= 0; i--) {
+          var b = bubbles[i];
+          var dx = x - b.x;
+          var dy = y - b.y;
+          if (dx * dx + dy * dy <= b.r * b.r) {
+            targetIndex = i;
+            break;
+          }
+        }
+
+        if (targetIndex === -1) return;
+
+        var cfg = this.config;
+        var original = bubbles[targetIndex];
+
+        // 以面积守恒计算子泡泡半径：r_child = r / sqrt(2)
+        var childRadius = original.r / Math.SQRT2;
+        var minR = cfg.splitMinRadius || cfg.minRadius;
+        if (childRadius <= minR) {
+          // 太小则不再分裂
+          return;
+        }
+
+        // 生成两颗子泡泡，颜色沿用原泡泡
+        var angle = Math.random() * Math.PI * 2;
+        var nx = Math.cos(angle);
+        var ny = Math.sin(angle);
+        var offset = childRadius * 0.3;
+
+        // 继承部分原速度，并加一点相反方向的“分裂冲量”
+        var baseVx = original.vx * 0.6;
+        var baseVy = original.vy * 0.6;
+        var kick = 30; // px/s
+
+        var child1 = this.createBubble(
+          original.x - nx * offset,
+          original.y - ny * offset,
+          childRadius,
+          original.color,
+          baseVx - nx * kick,
+          baseVy - ny * kick
+        );
+
+        var child2 = this.createBubble(
+          original.x + nx * offset,
+          original.y + ny * offset,
+          childRadius,
+          original.color,
+          baseVx + nx * kick,
+          baseVy + ny * kick
+        );
+
+        // 用子泡泡替换原泡泡
+        bubbles.splice(targetIndex, 1, child1, child2);
+      };
+
+      BubblesScreensaver.prototype.resolveCollision = function (b1, b2, cfg) {
+        var dx = b2.x - b1.x;
+        var dy = b2.y - b1.y;
+        var dist = Math.hypot(dx, dy) || 0.0001;
+        var minDist = b1.r + b2.r;
+
+        if (dist >= minDist) return;
+
+        var nx = dx / dist;
+        var ny = dy / dist;
+        var overlap = minDist - dist;
+
+        // 分离位置，避免穿模
+        var totalMass = b1.mass + b2.mass;
+        var move1 = overlap * (b2.mass / totalMass);
+        var move2 = overlap * (b1.mass / totalMass);
+
+        b1.x -= nx * move1;
+        b1.y -= ny * move1;
+        b2.x += nx * move2;
+        b2.y += ny * move2;
+
+        // 速度沿法线方向的简单弹性碰撞
+        var v1n = b1.vx * nx + b1.vy * ny;
+        var v2n = b2.vx * nx + b2.vy * ny;
+
+        var restitution = 0.9; // 弹性系数，略小于 1 更柔和
+        var p = (2 * (v1n - v2n)) / (b1.mass + b2.mass);
+
+        b1.vx -= p * b2.mass * nx * restitution;
+        b1.vy -= p * b2.mass * ny * restitution;
+        b2.vx += p * b1.mass * nx * restitution;
+        b2.vy += p * b1.mass * ny * restitution;
+
+        if (cfg.enableSoftBody) {
+          var strength = Math.min(overlap / Math.min(b1.r, b2.r), 1) * cfg.softBodyStrength;
+          var angle = Math.atan2(ny, nx);
+          b1.squish = Math.max(b1.squish, strength);
+          b2.squish = Math.max(b2.squish, strength);
+          b1.squishAngle = angle + Math.PI; // 挤压方向相反
+          b2.squishAngle = angle;
+        }
+      };
+
+      BubblesScreensaver.prototype.draw = function () {
+        var ctx = this.ctx;
+        var w = this.canvas.width / (window.devicePixelRatio || 1);
+        var h = this.canvas.height / (window.devicePixelRatio || 1);
+        var cfg = this.config;
+
+        // 拖影背景
+        ctx.save();
+        ctx.globalCompositeOperation = 'source-over';
+        // 使用偏亮的填充色，让整体背景不会被压成全黑
+        ctx.fillStyle = 'rgba(229, 240, 255, ' + cfg.trailAlpha + ')';
+        ctx.fillRect(0, 0, w, h);
+        ctx.restore();
+
+        // 绘制泡泡
+        for (var i = 0; i < this.bubbles.length; i++) {
+          this.drawBubble(this.bubbles[i]);
+        }
+      };
+
+      BubblesScreensaver.prototype.drawBubble = function (b) {
+        var ctx = this.ctx;
+        var cfg = this.config;
+        var r = b.r;
+
+        // --- 主体（可被软体挤压影响的部分）---
+        ctx.save();
+        ctx.translate(b.x, b.y);
+
+        // 软体形变：接触瞬间稍微被压扁（只影响泡泡轮廓和阴影，不影响高光朝向）
+        if (cfg.enableSoftBody && b.squish > 0.003) {
+          ctx.rotate(b.squishAngle);
+          var sx = 1 + b.squish * 0.6;
+          var sy = 1 - b.squish * 0.6;
+          ctx.scale(sx, sy);
+        }
+
+        // 整体透明度
+        ctx.globalAlpha = cfg.opacity;
+
+        // 内部渐变：中心几乎完全透明，只保留彩色和边缘高光
+        var grad = ctx.createRadialGradient(-r * 0.2, -r * 0.25, r * 0.1, 0, 0, r);
+        grad.addColorStop(0.0, 'rgba(255, 255, 255, 0.0)');
+        grad.addColorStop(0.35, 'rgba(255, 255, 255, 0.06)');
+        grad.addColorStop(0.7, b.color);
+        grad.addColorStop(0.96, 'rgba(255, 255, 255, 0.35)');
+        grad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fillStyle = grad;
+        ctx.fill();
+
+        // 右下整体阴影：改为非常轻的暗部，只在边缘略微加深
+        ctx.save();
+        ctx.globalCompositeOperation = 'multiply';
+        var shade = ctx.createRadialGradient(r * 0.45, r * 0.5, r * 0.1, 0, 0, r * 1.2);
+        shade.addColorStop(0.0, 'rgba(15, 23, 42, 0.0)');
+        shade.addColorStop(0.55, 'rgba(15, 23, 42, 0.12)');
+        shade.addColorStop(1.0, 'rgba(15, 23, 42, 0.0)');
+        ctx.beginPath();
+        ctx.arc(0, 0, r, 0, Math.PI * 2);
+        ctx.fillStyle = shade;
+        ctx.fill();
+        ctx.restore();
+
+        // 外圈白色环：从外到内渐变，整体偏柔和
+        // 基础柔和环
+        ctx.beginPath();
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
+        ctx.lineWidth = Math.max(1.0, r * 0.08);
+        ctx.arc(0, 0, r - ctx.lineWidth * 0.5, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // 内侧更亮但柔和的细环，使用径向渐变从外到内提亮
+        var ringGrad = ctx.createRadialGradient(0, 0, r * 0.7, 0, 0, r);
+        ringGrad.addColorStop(0.0, 'rgba(255, 255, 255, 0.0)');
+        ringGrad.addColorStop(0.55, 'rgba(255, 255, 255, 0.0)');
+        ringGrad.addColorStop(1.0, 'rgba(255, 255, 255, 0.65)');
+
+        ctx.beginPath();
+        ctx.strokeStyle = ringGrad;
+        ctx.lineWidth = Math.max(0.9, r * 0.045);
+        ctx.arc(0, 0, r - ctx.lineWidth * 1.1, 0, Math.PI * 2);
+        ctx.stroke();
+
+        ctx.restore();
+
+        // --- 顶部椭圆高光：始终位于左上角，不随软体旋转 ---
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        ctx.globalAlpha = Math.min(1, cfg.opacity + 0.15);
+        ctx.shadowColor = 'rgba(255, 255, 255, 0.9)';
+        ctx.shadowBlur = r * 0.8;
+        ctx.beginPath();
+        ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+        ctx.ellipse(-r * 0.2, -r * 0.28, r * 0.33, r * 0.2, -0.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      };
+
+      // 对外暴露：BubblesScreensaver.init(canvasId, config)
+      BubblesScreensaver.init = function (canvasId, config) {
+        var el = typeof canvasId === 'string' ? document.getElementById(canvasId) : canvasId;
+        if (!el) {
+          throw new Error('Bubble canvas not found: ' + canvasId);
+        }
+        return new BubblesScreensaver(el, config || {});
+      };
+
+      window.BubblesScreensaver = BubblesScreensaver;
+
+      // 默认启动一个实例，你也可以在别的页面手动调用 init
+      window.addEventListener('DOMContentLoaded', function () {
+        BubblesScreensaver.init('bubble-canvas', {
+          // 可以在这里覆盖默认参数，例如：
+          // bubbleCount: 32,
+          // minRadius: 30,
+          // maxRadius: 120,
+          // maxSpeed: 35,
+          // opacity: 0.8,
+          // trailAlpha: 0.16,
+          // enableSoftBody: true,
+          // softBodyStrength: 0.7,
+          // colors: [ ... 自定义颜色组 ... ]
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
