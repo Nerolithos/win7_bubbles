@@ -34,11 +34,11 @@
       display: block;
     }
 
-    .overlay-label {
+    .overlay-button {
       position: fixed;
       right: 16px;
       bottom: 14px;
-      padding: 6px 10px;
+      padding: 6px 12px;
       border-radius: 999px;
       background: rgba(15, 23, 42, 0.18);
       color: rgba(15, 23, 42, 0.75);
@@ -47,13 +47,28 @@
       text-transform: uppercase;
       backdrop-filter: blur(12px) saturate(140%);
       border: 1px solid rgba(148, 163, 184, 0.45);
-      pointer-events: none;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s ease, transform 0.1s ease, box-shadow 0.15s ease;
+      box-shadow: 0 6px 18px rgba(15, 23, 42, 0.22);
+    }
+
+    .overlay-button:hover {
+      background: rgba(15, 23, 42, 0.28);
+      color: rgba(248, 250, 252, 0.9);
+      box-shadow: 0 10px 26px rgba(15, 23, 42, 0.36);
+      transform: translateY(-0.5px);
+    }
+
+    .overlay-button:active {
+      transform: translateY(0.5px) scale(0.99);
+      box-shadow: 0 4px 14px rgba(15, 23, 42, 0.24);
     }
   </style>
 </head>
 <body>
   <canvas id="bubble-canvas"></canvas>
-  <div class="overlay-label">Bubble Screensaver · Lithos</div>
+  <button id="add-bubble-btn" class="overlay-button">+ Bubble</button>
 
   <script>
     (function () {
@@ -61,7 +76,7 @@
         bubbleCount: 24,
         minRadius: 34,
         maxRadius: 90,
-        maxSpeed: 45, // px / s，运动幅度更大
+        maxSpeed: 70, // px / s，整体运动更活泼
         opacity: 0.85,
         trailAlpha: 0.14, // 0 = 强拖影, 1 = 无拖影
         enableSoftBody: true,
@@ -91,6 +106,7 @@
         this.ctx = canvas.getContext('2d');
         this.config = mergeConfig(DEFAULT_CONFIG, config || {});
         this.bubbles = [];
+        this.extraBubbles = 0; // 通过按钮新增的泡泡数量
         this.lastTime = 0;
         this.running = false;
         this.resizeObserver = null;
@@ -131,7 +147,8 @@
 
         for (var i = 0; i < cfg.bubbleCount; i++) {
           var r = cfg.minRadius + Math.random() * (cfg.maxRadius - cfg.minRadius);
-          var speed = 10 + Math.random() * (cfg.maxSpeed - 10);
+          // 让基础泡泡整体稍微快一点
+          var speed = 18 + Math.random() * (cfg.maxSpeed - 18);
           var angle = Math.random() * Math.PI * 2;
 
           this.bubbles.push(this.createBubble(
@@ -157,9 +174,40 @@
           baseR: radius,
           mass: mass,
           color: color,
+          // 软体形变：标量 squish + 速度，用作弹簧振荡
           squish: 0,
-          squishAngle: 0
+          squishVel: 0,
+          idleTime: 0 // 低速累计时间，用来决定何时给随机运动
         };
+      };
+
+      // 通过按钮增加一颗新泡泡（最多只允许增加 15 颗）
+      BubblesScreensaver.prototype.addBubble = function () {
+        var cfg = this.config;
+        if (this.extraBubbles >= 15) return;
+
+        var w = this.canvas.width / (window.devicePixelRatio || 1);
+        var h = this.canvas.height / (window.devicePixelRatio || 1);
+
+        var r = cfg.minRadius + Math.random() * (cfg.maxRadius - cfg.minRadius);
+
+        // 新增的泡泡比默认速度更快，飘动感更明显
+        var base = cfg.maxSpeed * 0.6;
+        var speed = base + Math.random() * (cfg.maxSpeed - base);
+        var angle = Math.random() * Math.PI * 2;
+
+        var colorIndex = this.bubbles.length % cfg.colors.length;
+        var b = this.createBubble(
+          Math.random() * w,
+          Math.random() * h,
+          r,
+          cfg.colors[colorIndex],
+          Math.cos(angle) * speed,
+          Math.sin(angle) * speed
+        );
+
+        this.bubbles.push(b);
+        this.extraBubbles++;
       };
 
       BubblesScreensaver.prototype.start = function () {
@@ -193,23 +241,72 @@
           b.x += b.vx * dt;
           b.y += b.vy * dt;
 
-          // 软体挤压衰减
-          b.squish *= 0.9;
+          // 软体弹簧：让 squish 围绕 0 做阻尼振动，模拟“抖一抖再回到圆形”
+          if (cfg.enableSoftBody) {
+            var k = 110;      // 弹性系数（略低一点，频率更舒服）
+            var damping = 10; // 阻尼系数，减弱得更慢一点
 
+            // a = -k * x - c * v
+            var acc = -k * b.squish - damping * b.squishVel;
+            b.squishVel += acc * dt;
+            b.squish += b.squishVel * dt;
+
+            // 防止数值发散/形变过大
+            var maxSquish = 0.45;
+            if (b.squish > maxSquish) b.squish = maxSquish;
+            if (b.squish < -maxSquish) b.squish = -maxSquish;
+          }
+
+          // 边界碰撞：反弹 + 给一个压缩的“冲量”
           if (b.x - b.r < 0) {
             b.x = b.r;
             b.vx = Math.abs(b.vx);
+            if (cfg.enableSoftBody) {
+              // 水平方向撞击更明显，幅度和速度相关
+              var hit = Math.abs(b.vx);
+              b.squishVel += (0.01 * hit);
+            }
           } else if (b.x + b.r > w) {
             b.x = w - b.r;
             b.vx = -Math.abs(b.vx);
+            if (cfg.enableSoftBody) {
+              var hitR = Math.abs(b.vx);
+              b.squishVel += (0.01 * hitR);
+            }
           }
 
           if (b.y - b.r < 0) {
             b.y = b.r;
             b.vy = Math.abs(b.vy);
+            if (cfg.enableSoftBody) {
+              var hitT = Math.abs(b.vy);
+              b.squishVel += (0.01 * hitT);
+            }
           } else if (b.y + b.r > h) {
             b.y = h - b.r;
             b.vy = -Math.abs(b.vy);
+            if (cfg.enableSoftBody) {
+              var hitB = Math.abs(b.vy);
+              b.squishVel += (0.01 * hitB);
+            }
+          }
+
+          // 如果泡泡接近于静止，累积一段时间后给一个随机小推力
+          var speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+          var stillThreshold = 10; // px/s 以下算“很慢”
+          if (speed < stillThreshold) {
+            b.idleTime += dt;
+          } else {
+            b.idleTime = 0;
+          }
+
+          // 静止超过一定时间，施加一次随机方向的速度提升
+          if (b.idleTime > 1.2) { // 秒
+            var angle = Math.random() * Math.PI * 2;
+            var kickSpeed = 22 + Math.random() * 26; // 22 ~ 48 px/s
+            b.vx += Math.cos(angle) * kickSpeed;
+            b.vy += Math.sin(angle) * kickSpeed;
+            b.idleTime = 0;
           }
         }
 
@@ -320,12 +417,13 @@
         b2.vy += p * b1.mass * ny * restitution;
 
         if (cfg.enableSoftBody) {
-          var strength = Math.min(overlap / Math.min(b1.r, b2.r), 1) * cfg.softBodyStrength;
-          var angle = Math.atan2(ny, nx);
-          b1.squish = Math.max(b1.squish, strength);
-          b2.squish = Math.max(b2.squish, strength);
-          b1.squishAngle = angle + Math.PI; // 挤压方向相反
-          b2.squishAngle = angle;
+          // 按重叠程度和法线速度，给两颗泡泡一个更明显的“压缩冲量”
+          var relVn = Math.abs(v1n - v2n);
+          var overlapRatio = Math.min(overlap / Math.min(b1.r, b2.r), 1);
+          var base = overlapRatio * cfg.softBodyStrength * 0.008 * relVn;
+
+          b1.squishVel += base;
+          b2.squishVel += base;
         }
       };
 
@@ -358,11 +456,10 @@
         ctx.save();
         ctx.translate(b.x, b.y);
 
-        // 软体形变：接触瞬间稍微被压扁（只影响泡泡轮廓和阴影，不影响高光朝向）
-        if (cfg.enableSoftBody && b.squish > 0.003) {
-          ctx.rotate(b.squishAngle);
-          var sx = 1 + b.squish * 0.6;
-          var sy = 1 - b.squish * 0.6;
+        // 软体形变：使用缩放做更明显的椭圆形变，不再改变泡泡角度
+        if (cfg.enableSoftBody && Math.abs(b.squish) > 0.003) {
+          var sx = 1 + b.squish * 0.9;
+          var sy = 1 - b.squish * 0.9;
           ctx.scale(sx, sy);
         }
 
@@ -443,7 +540,7 @@
 
       // 默认启动一个实例，你也可以在别的页面手动调用 init
       window.addEventListener('DOMContentLoaded', function () {
-        BubblesScreensaver.init('bubble-canvas', {
+        var instance = BubblesScreensaver.init('bubble-canvas', {
           // 可以在这里覆盖默认参数，例如：
           // bubbleCount: 32,
           // minRadius: 30,
@@ -455,6 +552,14 @@
           // softBodyStrength: 0.7,
           // colors: [ ... 自定义颜色组 ... ]
         });
+
+        // 绑定右下角按钮：点击时增加一颗更快的泡泡
+        var btn = document.getElementById('add-bubble-btn');
+        if (btn && instance && typeof instance.addBubble === 'function') {
+          btn.addEventListener('click', function () {
+            instance.addBubble();
+          });
+        }
       });
     })();
   </script>
