@@ -107,6 +107,7 @@
         this.config = mergeConfig(DEFAULT_CONFIG, config || {});
         this.bubbles = [];
         this.extraBubbles = 0; // 通过按钮新增的泡泡数量
+        this.splitClearCircle = null; // 分裂时需要局部清理的大泡泡区域
         this.lastTime = 0;
         this.running = false;
         this.resizeObserver = null;
@@ -353,12 +354,13 @@
         var angle = Math.random() * Math.PI * 2;
         var nx = Math.cos(angle);
         var ny = Math.sin(angle);
-        var offset = childRadius * 0.3;
+        // 拉开一点距离，为“弹开”动作留空间
+        var offset = childRadius * 0.65;
 
-        // 继承部分原速度，并加一点相反方向的“分裂冲量”
-        var baseVx = original.vx * 0.6;
-        var baseVy = original.vy * 0.6;
-        var kick = 30; // px/s
+        // 继承部分原速度，并加上沿法线方向更强的“弹开”冲量
+        var baseVx = original.vx * 0.4;
+        var baseVy = original.vy * 0.4;
+        var kick = Math.max(40, this.config.maxSpeed * 0.9); // 弹开更有速度感
 
         var child1 = this.createBubble(
           original.x - nx * offset,
@@ -378,8 +380,23 @@
           baseVy + ny * kick
         );
 
+        // 刚分裂出来时带一点形变，让“弹开”更有弹性感
+        if (this.config.enableSoftBody) {
+          var initSquish = 0.18;
+          child1.squish = initSquish;
+          child2.squish = initSquish;
+        }
+
         // 用子泡泡替换原泡泡
         bubbles.splice(targetIndex, 1, child1, child2);
+
+        // 记录一块以原泡泡为中心的区域，在下一帧局部刷成背景色，
+        // 既能清掉大光圈，又不会整屏闪白
+        this.splitClearCircle = {
+          x: original.x,
+          y: original.y,
+          r: original.r * 1.2
+        };
       };
 
       BubblesScreensaver.prototype.resolveCollision = function (b1, b2, cfg) {
@@ -432,6 +449,19 @@
         var w = this.canvas.width / (window.devicePixelRatio || 1);
         var h = this.canvas.height / (window.devicePixelRatio || 1);
         var cfg = this.config;
+
+        // 分裂后仅在原大泡泡附近做一次局部清理，避免整屏闪白
+        if (this.splitClearCircle) {
+          var c = this.splitClearCircle;
+          ctx.save();
+          ctx.globalCompositeOperation = 'source-over';
+          ctx.fillStyle = 'rgba(229, 240, 255, 1)';
+          ctx.beginPath();
+          ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+          this.splitClearCircle = null;
+        }
 
         // 拖影背景
         ctx.save();
