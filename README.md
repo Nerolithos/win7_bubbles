@@ -2,7 +2,7 @@
 
 
 
-Rainbow-color bubbles with simple lighting, perferrably with collision imitation (not yet).
+Rainbow-color bubbles with simple lighting, with collision imitation.
 
 Run with `python  -m http.server xxxx`, or python3. No dependencies, yet.
 
