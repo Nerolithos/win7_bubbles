@@ -77,6 +77,7 @@
         minRadius: 34,
         maxRadius: 90,
         maxSpeed: 70, // px / s，整体运动更活泼
+        longPressMs: 380,
         opacity: 0.85,
         trailAlpha: 0.14, // 0 = 强拖影, 1 = 无拖影
         enableSoftBody: true,
@@ -106,27 +107,37 @@
         this.ctx = canvas.getContext('2d');
         this.config = mergeConfig(DEFAULT_CONFIG, config || {});
         this.bubbles = [];
+        this.stains = [];
         this.extraBubbles = 0; // 通过按钮新增的泡泡数量
-        this.splitClearCircle = null; // 分裂时需要局部清理的大泡泡区域
+        this.clearCircles = []; // 分裂/爆开时需要局部清理的大泡泡区域
         this.lastTime = 0;
         this.running = false;
         this.resizeObserver = null;
+        this.pressState = null;
 
         this._handleResize = this.handleResize.bind(this);
-        this._handleClick = this.handleClick.bind(this);
+        this._handlePointerDown = this.handlePointerDown.bind(this);
+        this._handlePointerUp = this.handlePointerUp.bind(this);
+        this._handlePointerCancel = this.handlePointerCancel.bind(this);
         this._loop = this.loop.bind(this);
 
         this.handleResize();
         this.initBubbles();
         this.start();
         window.addEventListener('resize', this._handleResize);
-        this.canvas.addEventListener('click', this._handleClick);
+        this.canvas.addEventListener('pointerdown', this._handlePointerDown);
+        this.canvas.addEventListener('pointerup', this._handlePointerUp);
+        this.canvas.addEventListener('pointerleave', this._handlePointerCancel);
+        this.canvas.addEventListener('pointercancel', this._handlePointerCancel);
       }
 
       BubblesScreensaver.prototype.destroy = function () {
         this.running = false;
         window.removeEventListener('resize', this._handleResize);
-        this.canvas.removeEventListener('click', this._handleClick);
+        this.canvas.removeEventListener('pointerdown', this._handlePointerDown);
+        this.canvas.removeEventListener('pointerup', this._handlePointerUp);
+        this.canvas.removeEventListener('pointerleave', this._handlePointerCancel);
+        this.canvas.removeEventListener('pointercancel', this._handlePointerCancel);
       };
 
       BubblesScreensaver.prototype.handleResize = function () {
@@ -178,8 +189,206 @@
           // 软体形变：标量 squish + 速度，用作弹簧振荡
           squish: 0,
           squishVel: 0,
-          idleTime: 0 // 低速累计时间，用来决定何时给随机运动
+          idleTime: 0, // 低速累计时间，用来决定何时给随机运动
+          state: 'normal',
+          opacity: 1,
+          explosionProgress: 0,
+          stainFade: 1,
+          burstFragments: null,
+          stainLayers: null,
+          _explosionCleared: false
         };
+      };
+
+      BubblesScreensaver.prototype.findBubbleAt = function (x, y) {
+        var bubbles = this.bubbles;
+        for (var i = bubbles.length - 1; i >= 0; i--) {
+          var b = bubbles[i];
+          if (b.state === 'exploding') continue;
+          var dx = x - b.x;
+          var dy = y - b.y;
+          if (dx * dx + dy * dy <= b.r * b.r) {
+            return { index: i, bubble: b };
+          }
+        }
+        return null;
+      };
+
+      BubblesScreensaver.prototype.findBubbleIndex = function (bubble) {
+        for (var i = 0; i < this.bubbles.length; i++) {
+          if (this.bubbles[i] === bubble) {
+            return i;
+          }
+        }
+        return -1;
+      };
+
+      BubblesScreensaver.prototype.queueClearCircle = function (x, y, r) {
+        this.clearCircles.push({ x: x, y: y, r: r });
+      };
+
+      BubblesScreensaver.prototype.buildBlobShape = function (radius, pointMin, pointRange) {
+        var pointCount = pointMin + Math.floor(Math.random() * pointRange);
+        var points = [];
+
+        for (var p = 0; p < pointCount; p++) {
+          var pointAngle = (p / pointCount) * Math.PI * 2;
+          var radiusJitter = 0.68 + Math.random() * 0.72;
+          points.push({
+            angle: pointAngle,
+            radius: radiusJitter * radius
+          });
+        }
+
+        return points;
+      };
+
+      BubblesScreensaver.prototype.createExplosionPayload = function (bubble) {
+        var layers = [];
+        var fragments = [];
+        var layerCount = 4;
+
+        for (var i = 0; i < layerCount; i++) {
+          var isCore = i < 2;
+          layers.push({
+            offsetX: isCore
+              ? (Math.random() - 0.5) * bubble.r * 0.14
+              : (Math.random() - 0.5) * bubble.r * 0.52,
+            offsetY: isCore
+              ? bubble.r * (0.5 + Math.random() * 0.12)
+              : bubble.r * (0.56 + Math.random() * 0.28),
+            width: isCore
+              ? bubble.r * (2.05 + i * 0.3 + Math.random() * 0.18)
+              : bubble.r * (1.05 + i * 0.22 + Math.random() * 0.18),
+            height: isCore
+              ? bubble.r * (0.96 + i * 0.14 + Math.random() * 0.08)
+              : bubble.r * (0.42 + i * 0.12 + Math.random() * 0.1),
+            rotation: (isCore ? (-7 + Math.random() * 14) : (-16 + Math.random() * 32)) * Math.PI / 180,
+            alpha: isCore ? 0.135 - i * 0.014 : 0.055 - (i - 2) * 0.01,
+            softness: isCore ? 1 : 0.72,
+            shape: this.buildBlobShape(
+              bubble.r * (isCore ? (0.96 + i * 0.06) : (0.4 + i * 0.1)),
+              isCore ? 11 : 8,
+              isCore ? 4 : 3
+            )
+          });
+        }
+
+        for (var j = 0; j < 14; j++) {
+          var angle = (Math.PI * 2 * j) / 14;
+          fragments.push({
+            angle: angle,
+            baseDistance: bubble.r * (0.45 + (j % 5) * 0.16),
+            speedFactor: 0.9 + (j % 4) * 0.18,
+            width: bubble.r * (0.18 + (j % 4) * 0.05),
+            height: bubble.r * (j % 3 === 0 ? 0.13 : 0.2),
+            rotation: (j % 2 === 0 ? 1 : -1) * (12 + j * 9),
+            alpha: 0.22 - (j % 4) * 0.02
+          });
+        }
+
+        return {
+          layers: layers,
+          fragments: fragments
+        };
+      };
+
+      BubblesScreensaver.prototype.drawOrganicBlob = function (ctx, blob) {
+        var points = blob.points;
+        if (!points || !points.length) return;
+
+        ctx.beginPath();
+        for (var i = 0; i < points.length; i++) {
+          var current = points[i];
+          var next = points[(i + 1) % points.length];
+          var radiusX = current.radius !== undefined ? current.radius : blob.radius * current.radius * blob.stretchX;
+          var radiusY = current.radius !== undefined ? current.radius : blob.radius * current.radius * blob.stretchY;
+          var nextRadiusX = next.radius !== undefined ? next.radius : blob.radius * next.radius * blob.stretchX;
+          var nextRadiusY = next.radius !== undefined ? next.radius : blob.radius * next.radius * blob.stretchY;
+          var currentX = Math.cos(current.angle) * radiusX * (blob.stretchX || 1);
+          var currentY = Math.sin(current.angle) * radiusY * (blob.stretchY || 1);
+          var nextX = Math.cos(next.angle) * nextRadiusX * (blob.stretchX || 1);
+          var nextY = Math.sin(next.angle) * nextRadiusY * (blob.stretchY || 1);
+          var midX = (currentX + nextX) * 0.5;
+          var midY = (currentY + nextY) * 0.5;
+
+          if (i === 0) {
+            ctx.moveTo(midX, midY);
+          }
+
+          ctx.quadraticCurveTo(currentX, currentY, midX, midY);
+        }
+        ctx.closePath();
+      };
+
+      BubblesScreensaver.prototype.burstBubble = function (targetIndex) {
+        var bubbles = this.bubbles;
+        var bubble = bubbles[targetIndex];
+        if (!bubble || bubble.state === 'exploding') return;
+
+        var payload = this.createExplosionPayload(bubble);
+        bubble.state = 'exploding';
+        bubble.vx *= 0.08;
+        bubble.vy *= 0.08;
+        bubble.explosionProgress = 0;
+        bubble.stainFade = 1;
+        bubble.opacity = 1;
+        bubble.squish = Math.max(bubble.squish, 0.16);
+        bubble.burstFragments = payload.fragments;
+        bubble.stainLayers = payload.layers;
+        bubble._explosionCleared = false;
+      };
+
+      BubblesScreensaver.prototype.splitBubble = function (targetIndex) {
+        var bubbles = this.bubbles;
+        var cfg = this.config;
+        var original = bubbles[targetIndex];
+        if (!original) return;
+
+        // 以面积守恒计算子泡泡半径：r_child = r / sqrt(2)
+        var childRadius = original.r / Math.SQRT2;
+        var minR = cfg.splitMinRadius || cfg.minRadius;
+        if (childRadius <= minR) {
+          return;
+        }
+
+        // 生成两颗子泡泡，颜色沿用原泡泡
+        var angle = Math.random() * Math.PI * 2;
+        var nx = Math.cos(angle);
+        var ny = Math.sin(angle);
+        var offset = childRadius * 0.65;
+
+        // 继承部分原速度，并加上沿法线方向更强的“弹开”冲量
+        var baseVx = original.vx * 0.4;
+        var baseVy = original.vy * 0.4;
+        var kick = Math.max(40, cfg.maxSpeed * 0.9);
+
+        var child1 = this.createBubble(
+          original.x - nx * offset,
+          original.y - ny * offset,
+          childRadius,
+          original.color,
+          baseVx - nx * kick,
+          baseVy - ny * kick
+        );
+
+        var child2 = this.createBubble(
+          original.x + nx * offset,
+          original.y + ny * offset,
+          childRadius,
+          original.color,
+          baseVx + nx * kick,
+          baseVy + ny * kick
+        );
+
+        if (cfg.enableSoftBody) {
+          var initSquish = 0.18;
+          child1.squish = initSquish;
+          child2.squish = initSquish;
+        }
+
+        bubbles.splice(targetIndex, 1, child1, child2);
+        this.queueClearCircle(original.x, original.y, original.r * 1.2);
       };
 
       // 通过按钮增加一颗新泡泡（最多只允许增加 15 颗）
@@ -236,9 +445,56 @@
         var h = this.canvas.height / (window.devicePixelRatio || 1);
         var bubbles = this.bubbles;
 
+        for (var stainIndex = this.stains.length - 1; stainIndex >= 0; stainIndex--) {
+          var stain = this.stains[stainIndex];
+          if (stain.fromExplosion && (!stain.stainFadeRef || stain.stainFadeRef.stainFade <= 0.02)) {
+            this.stains.splice(stainIndex, 1);
+            continue;
+          }
+          stain.life += dt;
+          if (stain.life >= stain.duration) {
+            this.stains.splice(stainIndex, 1);
+          }
+        }
+
         // 运动 & 边界反弹
-        for (var i = 0; i < bubbles.length; i++) {
+        for (var i = bubbles.length - 1; i >= 0; i--) {
           var b = bubbles[i];
+
+          if (b.state === 'exploding') {
+            b.vx *= 0.9;
+            b.vy *= 0.9;
+            b.explosionProgress = Math.min(1, b.explosionProgress + dt * 2.5);
+
+            var swellEnd = 0.38;
+            var isBursting = b.explosionProgress > swellEnd;
+            if (isBursting) {
+              b.stainFade = Math.max(0, b.stainFade - dt * 1.15);
+              b.opacity = 0;
+              if (!b._explosionCleared) {
+                this.queueClearCircle(b.x, b.y, b.r * 1.55);
+                this.stains.push({
+                  x: b.x,
+                  y: b.y,
+                  life: 0,
+                  duration: 1.9,
+                  fromExplosion: true,
+                  stainFadeRef: b,
+                  layers: b.stainLayers
+                });
+                b._explosionCleared = true;
+              }
+            } else {
+              b.opacity = 1;
+              b.stainFade = 1;
+            }
+
+            if (isBursting && b.stainFade <= 0.02) {
+              bubbles.splice(i, 1);
+            }
+            continue;
+          }
+
           b.x += b.vx * dt;
           b.y += b.vy * dt;
 
@@ -313,90 +569,56 @@
 
         // 互相碰撞 + 挤压
         for (var i = 0; i < bubbles.length; i++) {
+          if (bubbles[i].state === 'exploding') continue;
           for (var j = i + 1; j < bubbles.length; j++) {
+            if (bubbles[j].state === 'exploding') continue;
             this.resolveCollision(bubbles[i], bubbles[j], cfg);
           }
         }
       };
 
-      BubblesScreensaver.prototype.handleClick = function (event) {
+      BubblesScreensaver.prototype.handlePointerDown = function (event) {
+        if (event.button !== 0) return;
+
         var rect = this.canvas.getBoundingClientRect();
         var x = event.clientX - rect.left;
         var y = event.clientY - rect.top;
 
-        // 找离点击点最近且被点中的泡泡（从后往前，视觉上更靠上的优先）
-        var bubbles = this.bubbles;
-        var targetIndex = -1;
-        for (var i = bubbles.length - 1; i >= 0; i--) {
-          var b = bubbles[i];
-          var dx = x - b.x;
-          var dy = y - b.y;
-          if (dx * dx + dy * dy <= b.r * b.r) {
-            targetIndex = i;
-            break;
-          }
-        }
+        var hit = this.findBubbleAt(x, y);
+        if (!hit) return;
 
-        if (targetIndex === -1) return;
-
-        var cfg = this.config;
-        var original = bubbles[targetIndex];
-
-        // 以面积守恒计算子泡泡半径：r_child = r / sqrt(2)
-        var childRadius = original.r / Math.SQRT2;
-        var minR = cfg.splitMinRadius || cfg.minRadius;
-        if (childRadius <= minR) {
-          // 太小则不再分裂
-          return;
-        }
-
-        // 生成两颗子泡泡，颜色沿用原泡泡
-        var angle = Math.random() * Math.PI * 2;
-        var nx = Math.cos(angle);
-        var ny = Math.sin(angle);
-        // 拉开一点距离，为“弹开”动作留空间
-        var offset = childRadius * 0.65;
-
-        // 继承部分原速度，并加上沿法线方向更强的“弹开”冲量
-        var baseVx = original.vx * 0.4;
-        var baseVy = original.vy * 0.4;
-        var kick = Math.max(40, this.config.maxSpeed * 0.9); // 弹开更有速度感
-
-        var child1 = this.createBubble(
-          original.x - nx * offset,
-          original.y - ny * offset,
-          childRadius,
-          original.color,
-          baseVx - nx * kick,
-          baseVy - ny * kick
-        );
-
-        var child2 = this.createBubble(
-          original.x + nx * offset,
-          original.y + ny * offset,
-          childRadius,
-          original.color,
-          baseVx + nx * kick,
-          baseVy + ny * kick
-        );
-
-        // 刚分裂出来时带一点形变，让“弹开”更有弹性感
-        if (this.config.enableSoftBody) {
-          var initSquish = 0.18;
-          child1.squish = initSquish;
-          child2.squish = initSquish;
-        }
-
-        // 用子泡泡替换原泡泡
-        bubbles.splice(targetIndex, 1, child1, child2);
-
-        // 记录一块以原泡泡为中心的区域，在下一帧局部刷成背景色，
-        // 既能清掉大光圈，又不会整屏闪白
-        this.splitClearCircle = {
-          x: original.x,
-          y: original.y,
-          r: original.r * 1.2
+        var self = this;
+        this.pressState = {
+          x: x,
+          y: y,
+          targetBubble: hit.bubble,
+          longPressTriggered: false,
+          timerId: window.setTimeout(function () {
+            if (!self.pressState) return;
+            var targetIndex = self.findBubbleIndex(self.pressState.targetBubble);
+            if (targetIndex === -1) return;
+            self.pressState.longPressTriggered = true;
+            self.burstBubble(targetIndex);
+          }, this.config.longPressMs)
         };
+      };
+
+      BubblesScreensaver.prototype.handlePointerUp = function (event) {
+        if (event.button !== 0 || !this.pressState) return;
+
+        var pressState = this.pressState;
+        window.clearTimeout(pressState.timerId);
+        this.pressState = null;
+
+        if (pressState.longPressTriggered) return;
+
+        this.splitBubble(this.findBubbleIndex(pressState.targetBubble));
+      };
+
+      BubblesScreensaver.prototype.handlePointerCancel = function () {
+        if (!this.pressState) return;
+        window.clearTimeout(this.pressState.timerId);
+        this.pressState = null;
       };
 
       BubblesScreensaver.prototype.resolveCollision = function (b1, b2, cfg) {
@@ -450,17 +672,19 @@
         var h = this.canvas.height / (window.devicePixelRatio || 1);
         var cfg = this.config;
 
-        // 分裂后仅在原大泡泡附近做一次局部清理，避免整屏闪白
-        if (this.splitClearCircle) {
-          var c = this.splitClearCircle;
+        // 分裂/爆开后仅在原泡泡附近做一次局部清理，避免整屏闪白
+        if (this.clearCircles.length) {
           ctx.save();
           ctx.globalCompositeOperation = 'source-over';
           ctx.fillStyle = 'rgba(229, 240, 255, 1)';
-          ctx.beginPath();
-          ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
-          ctx.fill();
+          for (var clearIndex = 0; clearIndex < this.clearCircles.length; clearIndex++) {
+            var c = this.clearCircles[clearIndex];
+            ctx.beginPath();
+            ctx.arc(c.x, c.y, c.r, 0, Math.PI * 2);
+            ctx.fill();
+          }
           ctx.restore();
-          this.splitClearCircle = null;
+          this.clearCircles.length = 0;
         }
 
         // 拖影背景
@@ -471,32 +695,154 @@
         ctx.fillRect(0, 0, w, h);
         ctx.restore();
 
+        for (var stainIndex = 0; stainIndex < this.stains.length; stainIndex++) {
+          this.drawStain(this.stains[stainIndex]);
+        }
+
         // 绘制泡泡
         for (var i = 0; i < this.bubbles.length; i++) {
-          this.drawBubble(this.bubbles[i]);
+          if (this.bubbles[i].state === 'exploding') {
+            this.drawExplosion(this.bubbles[i]);
+          } else {
+            this.drawBubble(this.bubbles[i]);
+          }
         }
       };
 
-      BubblesScreensaver.prototype.drawBubble = function (b) {
+      BubblesScreensaver.prototype.drawStain = function (stain) {
+        var ctx = this.ctx;
+        var t = stain.life / stain.duration;
+        var alpha = stain.fromExplosion
+          ? Math.max(0, (stain.stainFadeRef ? stain.stainFadeRef.stainFade : 0))
+          : Math.max(0, (1 - t) * (1 - t));
+        if (alpha <= 0) return;
+
+        ctx.save();
+        ctx.translate(stain.x, stain.y);
+        ctx.globalCompositeOperation = 'source-over';
+
+        var layers = stain.layers || stain.blobs || [];
+        for (var i = 0; i < layers.length; i++) {
+          var blob = layers[i];
+          ctx.save();
+          ctx.translate(blob.x || blob.offsetX || 0, blob.y || blob.offsetY || 0);
+          ctx.rotate(blob.rotation);
+          ctx.scale(1 + t * 0.15, 0.96 + t * 0.07);
+
+          var blobAlpha = (blob.alpha || 0.08) * alpha;
+          var blobRadius = blob.radius || Math.max(blob.width, blob.height) * 0.5;
+          var stretchX = blob.width && blob.radius ? blob.width / (blob.radius * 2) : (blob.stretchX || 1);
+          var stretchY = blob.height && blob.radius ? blob.height / (blob.radius * 2) : (blob.stretchY || 1);
+          var shape = {
+            points: blob.shape || blob.points,
+            radius: blobRadius,
+            stretchX: stretchX,
+            stretchY: stretchY
+          };
+
+          ctx.shadowColor = 'rgba(124, 146, 166, ' + (blobAlpha * (blob.softness >= 1 ? 0.55 : 0.3)).toFixed(3) + ')';
+          ctx.shadowBlur = Math.max(8, blobRadius * (blob.softness >= 1 ? 0.48 : 0.28));
+          this.drawOrganicBlob(ctx, shape);
+          ctx.fillStyle = 'rgba(124, 146, 166, ' + blobAlpha.toFixed(3) + ')';
+          ctx.fill();
+
+          ctx.shadowBlur = 0;
+          if (!blob.softness || blob.softness < 0.9) {
+            ctx.lineWidth = Math.max(0.6, (blob.width || blob.radius || 20) * 0.016);
+            ctx.strokeStyle = 'rgba(255, 255, 255, ' + (blobAlpha * 0.1).toFixed(3) + ')';
+            this.drawOrganicBlob(ctx, shape);
+            ctx.stroke();
+          }
+
+          ctx.restore();
+        }
+
+        if (layers.length) {
+          ctx.save();
+          ctx.shadowColor = 'rgba(124, 146, 166, ' + (alpha * 0.12).toFixed(3) + ')';
+          ctx.shadowBlur = 18;
+          ctx.fillStyle = 'rgba(124, 146, 166, ' + (alpha * 0.04).toFixed(3) + ')';
+          ctx.beginPath();
+          ctx.ellipse(0, stain.fromExplosion ? 22 : 0, 48, 18, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        ctx.restore();
+      };
+
+      BubblesScreensaver.prototype.drawExplosion = function (bubble) {
+        var ctx = this.ctx;
+        var progress = bubble.explosionProgress || 0;
+        var swellEnd = 0.38;
+
+        if (progress <= swellEnd) {
+          var t = progress / swellEnd;
+          var scaleX = 1 + t * 0.55 + Math.sin(t * Math.PI) * 0.08;
+          var scaleY = 1 + t * 0.45 - Math.sin(t * Math.PI) * 0.08;
+
+          ctx.save();
+          ctx.translate(bubble.x, bubble.y);
+          ctx.scale(scaleX, scaleY);
+          this.drawBubbleAtOrigin(bubble);
+          this.drawBubbleHighlightAtOrigin(bubble);
+          ctx.restore();
+          return;
+        }
+
+        var burstProgress = (progress - swellEnd) / (1 - swellEnd);
+        var fragmentOpacity = Math.max(0, 1 - burstProgress * 1.12);
+        if (fragmentOpacity <= 0 || !bubble.burstFragments) return;
+
+        ctx.save();
+        ctx.translate(bubble.x, bubble.y);
+
+        for (var i = 0; i < bubble.burstFragments.length; i++) {
+          var fragment = bubble.burstFragments[i];
+          var distance = fragment.baseDistance + burstProgress * bubble.r * 1.55 * fragment.speedFactor;
+          var x = Math.cos(fragment.angle) * distance;
+          var y = Math.sin(fragment.angle) * distance * 0.76;
+          var width = fragment.width + burstProgress * bubble.r * 0.32;
+          var height = fragment.height + burstProgress * bubble.r * 0.2;
+
+          ctx.save();
+          ctx.translate(x, y);
+          ctx.rotate((fragment.rotation * Math.PI / 180) * (1 + burstProgress * 0.18));
+          ctx.globalAlpha = fragment.alpha * fragmentOpacity;
+          ctx.shadowColor = 'rgba(255, 255, 255, 0.32)';
+          ctx.shadowBlur = Math.max(4, width * 0.45);
+          ctx.fillStyle = 'rgba(216, 232, 245, 0.98)';
+          ctx.beginPath();
+          ctx.ellipse(0, 0, width, Math.max(3, height), 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.shadowBlur = 0;
+          ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+          ctx.lineWidth = Math.max(1, width * 0.06);
+          ctx.stroke();
+
+          ctx.beginPath();
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.26)';
+          ctx.ellipse(-width * 0.12, -height * 0.08, width * 0.28, Math.max(2, height * 0.32), 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.restore();
+        }
+
+        ctx.restore();
+      };
+
+      BubblesScreensaver.prototype.drawBubbleAtOrigin = function (b) {
         var ctx = this.ctx;
         var cfg = this.config;
         var r = b.r;
 
-        // --- 主体（可被软体挤压影响的部分）---
-        ctx.save();
-        ctx.translate(b.x, b.y);
-
-        // 软体形变：使用缩放做更明显的椭圆形变，不再改变泡泡角度
         if (cfg.enableSoftBody && Math.abs(b.squish) > 0.003) {
           var sx = 1 + b.squish * 0.9;
           var sy = 1 - b.squish * 0.9;
           ctx.scale(sx, sy);
         }
 
-        // 整体透明度
-        ctx.globalAlpha = cfg.opacity;
+        ctx.globalAlpha = cfg.opacity * (b.opacity === undefined ? 1 : b.opacity);
 
-        // 内部渐变：中心几乎完全透明，只保留彩色和边缘高光
         var grad = ctx.createRadialGradient(-r * 0.2, -r * 0.25, r * 0.1, 0, 0, r);
         grad.addColorStop(0.0, 'rgba(255, 255, 255, 0.0)');
         grad.addColorStop(0.35, 'rgba(255, 255, 255, 0.06)');
@@ -509,7 +855,6 @@
         ctx.fillStyle = grad;
         ctx.fill();
 
-        // 右下整体阴影：改为非常轻的暗部，只在边缘略微加深
         ctx.save();
         ctx.globalCompositeOperation = 'multiply';
         var shade = ctx.createRadialGradient(r * 0.45, r * 0.5, r * 0.1, 0, 0, r * 1.2);
@@ -522,15 +867,12 @@
         ctx.fill();
         ctx.restore();
 
-        // 外圈白色环：从外到内渐变，整体偏柔和
-        // 基础柔和环
         ctx.beginPath();
         ctx.strokeStyle = 'rgba(255, 255, 255, 0.14)';
         ctx.lineWidth = Math.max(1.0, r * 0.08);
         ctx.arc(0, 0, r - ctx.lineWidth * 0.5, 0, Math.PI * 2);
         ctx.stroke();
 
-        // 内侧更亮但柔和的细环，使用径向渐变从外到内提亮
         var ringGrad = ctx.createRadialGradient(0, 0, r * 0.7, 0, 0, r);
         ringGrad.addColorStop(0.0, 'rgba(255, 255, 255, 0.0)');
         ringGrad.addColorStop(0.55, 'rgba(255, 255, 255, 0.0)');
@@ -541,19 +883,33 @@
         ctx.lineWidth = Math.max(0.9, r * 0.045);
         ctx.arc(0, 0, r - ctx.lineWidth * 1.1, 0, Math.PI * 2);
         ctx.stroke();
+      };
 
-        ctx.restore();
+      BubblesScreensaver.prototype.drawBubbleHighlightAtOrigin = function (b) {
+        var ctx = this.ctx;
+        var cfg = this.config;
+        var r = b.r;
 
-        // --- 顶部椭圆高光：始终位于左上角，不随软体旋转 ---
-        ctx.save();
-        ctx.translate(b.x, b.y);
-        ctx.globalAlpha = Math.min(1, cfg.opacity + 0.15);
+        ctx.globalAlpha = Math.min(1, cfg.opacity + 0.15) * (b.opacity === undefined ? 1 : b.opacity);
         ctx.shadowColor = 'rgba(255, 255, 255, 0.9)';
         ctx.shadowBlur = r * 0.8;
         ctx.beginPath();
         ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
         ctx.ellipse(-r * 0.2, -r * 0.28, r * 0.33, r * 0.2, -0.5, 0, Math.PI * 2);
         ctx.fill();
+      };
+
+      BubblesScreensaver.prototype.drawBubble = function (b) {
+        var ctx = this.ctx;
+
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        this.drawBubbleAtOrigin(b);
+        ctx.restore();
+
+        ctx.save();
+        ctx.translate(b.x, b.y);
+        this.drawBubbleHighlightAtOrigin(b);
         ctx.restore();
       };
 
